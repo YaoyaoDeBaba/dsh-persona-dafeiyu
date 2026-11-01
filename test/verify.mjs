@@ -185,6 +185,17 @@ async function check(label, fn) {
   }
 }
 
+/**
+ * 清空会话选择文件。
+ *
+ * 0.7.4 起会话选择会落盘，而所有用例共用一个 `DSH_HOME`。不清理的话，
+ * 前一个用例给 `sess-A` 挑的人设会漏进后一个用例——在内存版里这从来不是问题，
+ * 是落盘引入的新耦合。需要「从空表开始」的用例调用它。
+ */
+function resetSessionPicks() {
+  fs.rmSync(plugin.sessionPicksPath(), { force: true })
+}
+
 // ---------------------------------------------------------------- 宿主侧：内置与默认
 
 await check('默认注册动态人设段落（order 0 / 禁止插值），渲染出大肥鱼正文', () => {
@@ -442,6 +453,7 @@ await check('启停：停用当前人设后提示词里不再注入，设为当�
 // ---------------------------------------------------------------- 生效范围：全局 / 会话
 
 await check('会话生效：会话挑的人设只影响该会话，其它会话回落到全局', async () => {
+  resetSessionPicks()
   const ctx = makeCtx()
   plugin.apply(ctx, undefined)
   const section = ctx.state.sections.find((entry) => entry.name === 'dafeiyu:persona')
@@ -480,6 +492,7 @@ await check('会话生效：会话挑的人设只影响该会话，其它会话�
 })
 
 await check('会话不启用人设：是终止符，不回落到工作区 / 全局', async () => {
+  resetSessionPicks()
   const ctx = makeCtx()
   plugin.apply(ctx, undefined)
   const section = ctx.state.sections.find((entry) => entry.name === 'dafeiyu:persona')
@@ -710,11 +723,18 @@ await check('坏数据兜底：JSON 损坏时回退到空库而不是抛错', ()
 
 // ---------------------------------------------------------------- issue #3：三档持久化 + 全局不启用
 
-/** 直接写一份人设库文件，模拟「上一次运行留下的磁盘状态」。 */
+/**
+ * 直接写一份人设库文件，模拟「上一次运行留下的磁盘状态」。
+ *
+ * 同时清掉会话选择文件：从 0.7.4 起会话选择会落盘，而所有用例共享同一个
+ * `DSH_HOME`。不清理的话，前一个用例挑的人设会漏到后一个用例里，
+ * 表现为「明明没设却选了」——这个隔离问题在内存版里不存在，是落盘引入的。
+ */
 function seedStore(payload) {
   const file = plugin.personaStorePath()
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, JSON.stringify(payload))
+  fs.rmSync(plugin.sessionPicksPath(), { force: true })
   return file
 }
 
@@ -2595,6 +2615,103 @@ await check('包清单：bundle patch / client bundle / patch 内容都对得上
     '@deepseek-ai/dsh-client-locale',
   ])
   assert.ok(fs.existsSync(path.join(root, 'lib', 'client.js')), 'lib/client.js 缺失')
+})
+
+await check('会话选择：落盘后重启能读回（issue #8 的核心）', async () => {
+  // 场景：会话档下给两个会话各挑一条人设，然后**模拟重启**（重新 apply 一次插件上下文），
+  // 确认两条选择都还在。这正是 issue #8 报的「重启后每个会话的人格全部丢失」。
+  const ctx = makeCtx()
+  plugin.apply(ctx, undefined)
+  await sendMutate(ctx, { action: 'set-mode', mode: 'session' })
+  await sendMutate(ctx, { action: 'set-session-persona', sessionId: 'session-aaa', personaId: 'acha' })
+  await sendMutate(ctx, { action: 'set-session-persona', sessionId: 'session-bbb', personaId: 'tinglan' })
+
+  const file = plugin.sessionPicksPath()
+  assert.ok(fs.existsSync(file), `应写出会话选择文件：${file}`)
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'))
+  assert.equal(onDisk.version, 1, '文件应带版本号')
+  assert.equal(onDisk.picks['session-aaa'], 'acha')
+  assert.equal(onDisk.picks['session-bbb'], 'tinglan')
+
+  // 模拟重启：新建一套完全独立的插件上下文
+  const reborn = makeCtx()
+  plugin.apply(reborn, undefined)
+  const state = (await readState(reborn, { url: `${STATUS_PATH}?sessionId=session-aaa` })).payload.value
+  assert.ok(state.sessionPersona, '重启后 session-aaa 应当还有人设')
+  assert.equal(state.sessionPersona.id, 'acha', '重启后应仍是阿茶')
+
+  const stateB = (await readState(reborn, { url: `${STATUS_PATH}?sessionId=session-bbb` })).payload.value
+  assert.equal(stateB.sessionPersona.id, 'tinglan', '重启后 session-bbb 应仍是听澜')
+})
+
+await check('会话选择：set-current 带 sessionId 时落到该会话（不带则只改全局）', async () => {
+  const ctx = makeCtx()
+  plugin.apply(ctx, undefined)
+  await sendMutate(ctx, { action: 'set-mode', mode: 'session' })
+
+  // ① 带 sessionId：既是「设为当前」，也是「这个会话用它」
+  await sendMutate(ctx, { action: 'set-current', id: 'acha', sessionId: 'session-ccc' })
+  const withId = (await readState(ctx, { url: `${STATUS_PATH}?sessionId=session-ccc` })).payload.value
+  assert.equal(withId.sessionPersona?.id, 'acha', '带 sessionId 时该会话应选中阿茶')
+
+  // ② 不带 sessionId（设置页就是这么发的）：只改全局，**不该**污染任何会话
+  await sendMutate(ctx, { action: 'set-current', id: 'tinglan' })
+  const stillC = (await readState(ctx, { url: `${STATUS_PATH}?sessionId=session-ccc` })).payload.value
+  assert.equal(stillC.sessionPersona?.id, 'acha', '不带 sessionId 时不应改动已有会话选择')
+  const fresh = (await readState(ctx, { url: `${STATUS_PATH}?sessionId=session-zzz` })).payload.value
+  assert.equal(fresh.sessionPersona, null, '未选过的会话不该凭空多出选择')
+})
+
+await check('会话选择：读取时丢掉指向已删除人设的幽灵条目', async () => {
+  const ctx = makeCtx()
+  plugin.apply(ctx, undefined)
+  await sendMutate(ctx, { action: 'set-mode', mode: 'session' })
+
+  // 先导入一条自定义人设并挂到会话上
+  const imported = await sendMutate(ctx, { action: 'import', name: '临时人格', text: '你是临时人格。' })
+  assert.equal(imported.payload.ok, true, '导入应成功')
+  const importedId = imported.payload.value.personas.find((p) => p.name === '临时人格').id
+  await sendMutate(ctx, { action: 'set-session-persona', sessionId: 'session-gone', personaId: importedId })
+
+  // 再把它删掉——会话表里会留下一个指向不存在人设的 id
+  await sendMutate(ctx, { action: 'remove', id: importedId })
+
+  // 「重启」后读盘：那条幽灵必须被过滤掉
+  const reborn = makeCtx()
+  plugin.apply(reborn, undefined)
+  const state = (await readState(reborn, { url: `${STATUS_PATH}?sessionId=session-gone` })).payload.value
+  assert.equal(state.sessionPersona, null, '指向已删除人设的条目应被丢弃，而不是显示成空壳')
+})
+
+await check('会话选择：落盘文件损坏时按空表处理，不抛错', () => {
+  const file = plugin.sessionPicksPath()
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, '{ 这不是合法 JSON', 'utf8')
+
+  const ctx = makeCtx()
+  // 不该抛：读盘失败只意味着这次没有会话级选择
+  plugin.apply(ctx, undefined)
+  const picks = plugin.createSessionPicks()
+  assert.equal(picks.size(), 0, '坏文件应按空表处理')
+})
+
+await check('会话选择：多实例写盘会合并，不互相覆盖', () => {
+  // 清掉上一条用例留下的坏文件
+  const file = plugin.sessionPicksPath()
+  fs.rmSync(file, { force: true })
+
+  const a = plugin.createSessionPicks()
+  a.set('session-a1', 'acha')
+  // 第二个「进程」读到的是磁盘上的现状
+  const b = plugin.createSessionPicks()
+  b.set('session-b1', 'tinglan')
+  // a 再写一次：不能把 b 写进去的 b1 抹掉
+  a.set('session-a2', 'dafeiyu')
+
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8')).picks
+  assert.equal(onDisk['session-a1'], 'acha')
+  assert.equal(onDisk['session-a2'], 'dafeiyu')
+  assert.equal(onDisk['session-b1'], 'tinglan', '另一实例写入的条目不能被覆盖掉')
 })
 
 // 清理临时 home

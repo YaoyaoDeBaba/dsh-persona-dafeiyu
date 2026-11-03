@@ -1083,6 +1083,93 @@ await check('预览：停用后人设段为空、后缀照旧；方法不对 405
   assert.equal(farResponse.captured.status, 403)
 })
 
+// ---------------------------------------------------------------- 时间差段与体积守卫（0.7.5）
+
+await check('时间差段：注册在最后、正文带日期星期；首次对话有明确说法', () => {
+  const ctx = makeCtx()
+  plugin.apply(ctx, undefined)
+  const clock = ctx.state.sections.find((entry) => entry.name === 'dafeiyu:clock')
+  assert.ok(clock, '时间差段应被注册')
+  const suffix = ctx.state.sections.find((entry) => entry.name === 'dafeiyu:persona-suffix')
+  assert.ok(clock.order > (suffix ? suffix.order : 0), '时间差段必须排在最后（它是易变段）')
+  const text = clock.text()
+  assert.match(text, /^【时间】现在是 \d+ 月 \d+ 日 周[一二三四五六日] \d{2}:\d{2}；/)
+  assert.match(text, /第一次对话|接着刚才的话|距上次对话/)
+})
+
+await check('时间差段：隔了三小时回来会写「距上次对话 3 小时」，同一场对话不重复报差', async () => {
+  const now = Date.now()
+  seedStore({
+    version: 1,
+    mode: 'global',
+    current: 'dafeiyu',
+    disabled: [],
+    personas: [],
+    workspaces: [],
+    clock: { enabled: true, lastSeen: now - 3 * 3600 * 1000 - 5 * 60 * 1000 },
+    truncate: { enabled: false, max: 8000 },
+  })
+  const ctx = makeCtx()
+  plugin.apply(ctx, undefined)
+  const clock = ctx.state.sections.find((entry) => entry.name === 'dafeiyu:clock')
+  assert.match(clock.text(), /距上次对话 3 小时/)
+  // 求值已经把 lastSeen 推到刚才：间隔之内不再算「新的一轮」
+  assert.match(clock.text(), /接着刚才的话/)
+})
+
+await check('时间差段：纯函数换算 + 开关关掉后一个字都不注入', async () => {
+  assert.equal(plugin.humanGap(45_000), '1 分钟')
+  assert.equal(plugin.humanGap(45 * 60 * 1000), '45 分钟')
+  assert.equal(plugin.humanGap(3 * 3600 * 1000), '3 小时')
+  assert.equal(plugin.humanGap((2 * 24 + 5) * 3600 * 1000), '2 天 5 小时')
+
+  const ctx = makeCtx()
+  plugin.apply(ctx, undefined)
+  const off = await sendMutate(ctx, { action: 'set-clock', enabled: false })
+  assert.equal(off.payload.ok, true, off.payload.error)
+  const clock = ctx.state.sections.find((entry) => entry.name === 'dafeiyu:clock')
+  assert.equal(clock.text(), '', '关掉后不许往提示词里塞字')
+  const preview = (await readPreview(ctx, { url: PREVIEW_PATH })).payload.value
+  assert.equal(preview.sections.find((section) => section.name === 'dafeiyu:clock').chars, 0)
+  await sendMutate(ctx, { action: 'set-clock', enabled: true })
+})
+
+await check('体积守卫：超 8000 字标黄；打开截断后注入变短，库里的正文不动', async () => {
+  const long = '甲'.repeat(9_000)
+  seedStore({
+    version: 1,
+    mode: 'global',
+    current: 'big',
+    disabled: [],
+    workspaces: [],
+    clock: { enabled: false, lastSeen: 0 },
+    personas: [{ id: 'big', name: '大卡', text: long }],
+    truncate: { enabled: false, max: 8000 },
+  })
+  const ctx = makeCtx()
+  plugin.apply(ctx, undefined)
+  const before = (await readState(ctx)).payload.value
+  assert.equal(before.guard.warn, true, '9000 字应该标黄')
+  assert.equal(before.guard.truncate.applied, false)
+
+  const on = await sendMutate(ctx, { action: 'set-truncate', enabled: true, max: 2000 })
+  assert.equal(on.payload.ok, true, on.payload.error)
+  assert.equal(on.payload.value.guard.truncate.applied, true)
+  assert.equal(on.payload.value.chars, long.length, '状态里的 chars 是库里的长度，不该被截断改动')
+
+  // 注入这一侧被截断了（预览与真实注入同源）
+  const preview = (await readPreview(ctx, { url: PREVIEW_PATH })).payload.value
+  assert.equal(preview.chars, 2000, '注入长度应被截到 max')
+  // 库里的正文一个字都不许少
+  assert.equal((await readPersona(ctx, 'big')).payload.value.chars, long.length)
+
+  const bad = await sendMutate(ctx, { action: 'set-truncate', max: 5 })
+  assert.equal(bad.payload.ok, false, '荒谬的 max 要拒绝')
+
+  // 还原基线，后面的用例还要看到默认那份库
+  seedStore({ version: 1, mode: 'global', current: 'dafeiyu', disabled: [], personas: [], workspaces: [] })
+})
+
 // ---------------------------------------------------------------- config 人设与总开关
 
 await check('config 人设：prefix / personaFile 以 source=config 出现在列表并可选中', async () => {
@@ -1604,6 +1691,11 @@ await check('客户端：用真实宿主快照渲染 ready 分支（列表 / 导
   assert.ok(text.includes('阿茶'), '列表应含内置阿茶')
   assert.ok(text.includes('渲染用人设'), '列表应含导入的人设')
   assert.ok(text.includes('currentBadge'), '当前人设应有「当前」标记')
+  // 时间差段与体积守门这两块也得真出现在设置页里（不能只是字典里有键）
+  assert.ok(text.includes('clockTitle'), '设置页应有时间差段')
+  assert.ok(text.includes('guardTitle'), '设置页应有体积守门')
+  assert.ok(text.includes('truncateOff'), '设置页应有「不截断」这一档')
+  assert.ok(text.includes('clockHint'), '时间差段要带说明（它不是开关就完事的东西）')
   assert.ok(text.includes('importTitle'), '应有导入区')
   assert.ok(text.includes('importAction'))
   assert.ok(text.includes('importHint'))

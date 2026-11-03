@@ -68,6 +68,7 @@ const fallbackPlugin = await loadPlugin(false)
 const STATUS_PATH = '/api/dsh-persona-dafeiyu/status'
 const MUTATE_PATH = '/api/dsh-persona-dafeiyu/mutate'
 const PERSONA_PATH = '/api/dsh-persona-dafeiyu/persona'
+const PREVIEW_PATH = '/api/dsh-persona-dafeiyu/preview'
 
 /** 最小可用的插件上下文替身。 */
 function makeCtx() {
@@ -157,6 +158,13 @@ async function readPersona(ctx, id, options) {
   const response = makeResponse()
   const url = id === undefined ? PERSONA_PATH : `${PERSONA_PATH}?id=${encodeURIComponent(id)}`
   await routeOf(ctx, PERSONA_PATH).handler(makeRequest({ url, ...options }), response)
+  return { status: response.captured.status, payload: response.json() }
+}
+
+/** 读一次「这一轮真正要注入什么」。 */
+async function readPreview(ctx, options) {
+  const response = makeResponse()
+  await routeOf(ctx, PREVIEW_PATH).handler(makeRequest(options), response)
   return { status: response.captured.status, payload: response.json() }
 }
 
@@ -998,15 +1006,81 @@ await check('接口纪律：非回环 403，方法不对 405，坏 JSON 400，�
   assert.match(unknown.payload.error, /未知操作/)
 })
 
-await check('接口：注册了三条回环路由，且只依赖 webServer', () => {
+await check('接口：注册了四条回环路由，且只依赖 webServer', () => {
   const ctx = makeCtx()
   plugin.apply(ctx, undefined)
   assert.deepEqual(ctx.state.injections, [['webServer']])
   assert.deepEqual(
     ctx.state.routes.map((route) => route.path).sort(),
-    [MUTATE_PATH, PERSONA_PATH, STATUS_PATH].sort(),
+    [MUTATE_PATH, PERSONA_PATH, PREVIEW_PATH, STATUS_PATH].sort(),
   )
   assert.ok(ctx.state.routes.every((route) => route.kind === 'exact'))
+})
+
+// ---------------------------------------------------------------- 预览接口（0.7.5）]
+
+await check('预览：给的就是真实注入的那份文本，段落顺序从稳定到易变', async () => {
+  const ctx = makeCtx()
+  plugin.apply(ctx, undefined)
+  const preview = (await readPreview(ctx, { url: PREVIEW_PATH })).payload.value
+  assert.equal(preview.enabled, true)
+  assert.equal(preview.persona.name, '大肥鱼')
+  assert.equal(preview.source, 'global')
+  const personaSection = preview.sections.find((section) => section.name === 'dafeiyu:persona')
+  assert.ok(personaSection, '预览里应有 dafeiyu:persona 段')
+  // ★ 这条是预览的意义所在：预览里那段文本必须等于真段落求值的结果
+  assert.equal(personaSection.text, sectionText(ctx))
+  assert.equal(preview.chars, preview.sections.reduce((sum, section) => sum + section.chars, 0))
+  const orders = preview.sections.map((section) => section.order)
+  assert.deepEqual(orders, [...orders].sort((a, b) => a - b), '段落顺序必须单调不减（稳定段在前）')
+})
+
+await check('预览：命中层跟着会话与工作区变（与 status 同一份解析）', async () => {
+  const ctx = makeCtx()
+  plugin.apply(ctx, undefined)
+  const mode = await sendMutate(ctx, { action: 'set-mode', mode: 'session' })
+  assert.equal(mode.payload.ok, true, mode.payload.error)
+  const pick = await sendMutate(ctx, { action: 'set-session-persona', personaId: 'acha', sessionId: 'sess-p' })
+  assert.equal(pick.payload.ok, true, pick.payload.error)
+  try {
+    const mine = (await readPreview(ctx, { url: `${PREVIEW_PATH}?sessionId=sess-p` })).payload.value
+    assert.equal(mine.source, 'session')
+    assert.equal(mine.persona.name, '阿茶')
+    // 会话档下预览必须给出「这一会话」那条人设的正文（与 persona 接口同一份数据）
+    const achaText = (await readPersona(ctx, 'acha')).payload.value.text
+    assert.equal(
+      mine.sections.find((section) => section.name === 'dafeiyu:persona').text,
+      achaText,
+      '会话档下预览要给出该会话选中那条的正文',
+    )
+    const other = (await readPreview(ctx, { url: `${PREVIEW_PATH}?sessionId=sess-q` })).payload.value
+    assert.equal(other.source, 'global', '别的会话没挑过，应回落到全局')
+    assert.notEqual(other.persona.name, '阿茶')
+  } finally {
+    // 这份 store 是全文件共用的：改完必须还原，否则后面的用例看到的是一个会话档
+    await sendMutate(ctx, { action: 'set-session-persona', personaId: null, sessionId: 'sess-p' })
+    await sendMutate(ctx, { action: 'set-mode', mode: 'global' })
+  }
+})
+
+await check('预览：停用后人设段为空、后缀照旧；方法不对 405、非回环 403', async () => {
+  const ctx = makeCtx()
+  plugin.apply(ctx, { enabled: false, suffix: '【后缀】' })
+  const off = (await readPreview(ctx, { url: PREVIEW_PATH })).payload.value
+  assert.equal(off.enabled, false)
+  const personaSection = off.sections.find((section) => section.name === 'dafeiyu:persona')
+  assert.ok(personaSection ? personaSection.chars === 0 : true, '停用时人设段不该有正文')
+  const suffixSection = off.sections.find((section) => section.name === 'dafeiyu:persona-suffix')
+  assert.ok(suffixSection, '前缀停用不影响后缀')
+  assert.equal(suffixSection.text, '【后缀】')
+
+  const wrongMethod = makeResponse()
+  await routeOf(ctx, PREVIEW_PATH).handler(makeRequest({ method: 'POST', url: PREVIEW_PATH }), wrongMethod)
+  assert.equal(wrongMethod.captured.status, 405)
+
+  const farResponse = makeResponse()
+  await routeOf(ctx, PREVIEW_PATH).handler(makeRequest({ url: PREVIEW_PATH, address: '10.0.0.9' }), farResponse)
+  assert.equal(farResponse.captured.status, 403)
 })
 
 // ---------------------------------------------------------------- config 人设与总开关
